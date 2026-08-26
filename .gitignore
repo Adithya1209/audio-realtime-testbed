@@ -1,0 +1,36 @@
+# Build and Intermediate Directories
+build/
+bin/
+out/
+.vs/
+*.dir/
+
+# Compiled Object files, Libraries, Executables
+*.obj
+*.o
+*.lib
+*.a
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.ilk
+*.idb
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+_deps/
+
+# OS and Editor specific
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
