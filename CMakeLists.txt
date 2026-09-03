@@ -4,8 +4,16 @@ project(AudioRealtimeTestbed CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Force WASAPI backend on Windows
-set(RTAUDIO_API_WASAPI ON CACHE BOOL "Build WASAPI API" FORCE)
+if(WIN32)
+    set(RTAUDIO_API_WASAPI ON CACHE BOOL "Build WASAPI API" FORCE)
+    set(RTAUDIO_API_DS OFF CACHE BOOL "Build DirectSound API" FORCE)
+elseif(APPLE)
+    set(RTAUDIO_API_CORE ON CACHE BOOL "Build CoreAudio API" FORCE)
+else()
+    # Linux (ALSA / PulseAudio)
+    set(RTAUDIO_API_ALSA ON CACHE BOOL "Build ALSA API" FORCE)
+    set(RTAUDIO_API_PULSE ON CACHE BOOL "Build PulseAudio API" FORCE)
+endif()
 
 include(FetchContent)
 FetchContent_Declare(

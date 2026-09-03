@@ -10,6 +10,7 @@
 #include <memory>
 #include "RtAudio.h"
 #include "SPSCQueue.hpp"
+#include "HeapPoisoner.hpp"
 
 constexpr double PI = 3.14159265358979323846;
 
@@ -23,6 +24,11 @@ struct AudioContext {
     double frequency = 440.0;     // 440 Hz (A4 tone)
     double sampleRate = 48000.0;
     SPSCQueue<CallbackTelemetry, 65536> telemetryQueue;
+
+    // Stress Test Controls:
+    bool stressHeap = true;              // Enable/disable hot-path malloc
+    size_t numAllocationsPerCallback = 4; // Simulate 4 temporary scratch buffers
+    size_t allocationSizeBytes = 4096;    // 1024 bytes each (total 4KB per block)
 };
 
 // The Hard Real-Time Audio Callback (The Hot Path)
@@ -30,11 +36,27 @@ int audioCallback(void* outputBuffer, void* /*inputBuffer*/, unsigned int nBuffe
                   double /*streamTime*/, RtAudioStreamStatus status, void* userData) {
 
     const auto startTime = std::chrono::steady_clock::now();
+    auto* ctx = static_cast<AudioContext*>(userData);
+
+    // --- HEAP ALLOCATION STRESS TEST ---
+    if (ctx->stressHeap) {
+        static const size_t stressSizes[4] = {512, 2048, 4096, 8192};
+        void* scratchBlocks[4] = {nullptr, nullptr, nullptr, nullptr};
+
+        for (size_t a = 0; a < 4; ++a) {
+            // Allocate dynamically on the real-time audio thread
+            scratchBlocks[a] = std::malloc(stressSizes[a]);
+            if (scratchBlocks[a]) std::memset(scratchBlocks[a], 0, stressSizes[a]);
+        }
+
+        for(size_t a = 0; a < 4; ++a){
+            if(scratchBlocks[a]) std::free(scratchBlocks[a]);
+        }
+    }
 
     const bool underflow = (status & RTAUDIO_OUTPUT_UNDERFLOW) != 0;
 
     auto* buffer = static_cast<float*>(outputBuffer);
-    auto* ctx = static_cast<AudioContext*>(userData);
 
     const double phaseIncrement = 2.0 * PI * ctx->frequency / ctx->sampleRate;
 
@@ -141,6 +163,17 @@ int main() {
     RtAudio::DeviceInfo info = dac.getDeviceInfo(defaultDevice);
     std::cout << "Using Output Device: " << info.name << " (ID: " << defaultDevice << ")\n";
 
+    // Initialize and run Heap Poisoner
+    HeapPoisoner poisoner;
+    poisoner.printHeapStats("Baseline (Before Poisoning)");
+
+    HeapPoisoner::Config poisonConfig;
+    poisonConfig.totalAllocations = 100000;
+    poisonConfig.freeStride = 2;
+
+    poisoner.fragmentHeap(poisonConfig);
+    poisoner.printHeapStats("After Heap Poisoning");
+
     // Allocate AudioContext on the Heap to prevent stack overflow from 1MB queue buffer
     auto ctx = std::make_unique<AudioContext>();
 
@@ -180,18 +213,19 @@ int main() {
     std::cout << " - Buffer Size: " << bufferFrames << " frames\n";
     std::cout << " - Real-Time Callback Deadline Budget: " << budgetMs << " ms (" << (budgetMs * 1000.0) << " us)\n\n";
 
+    poisoner.startBackgroundChurn(2);
     err = dac.startStream();
     if (err != RTAUDIO_NO_ERROR) {
         std::cerr << "[ERROR] Failed to start stream: " << dac.getErrorText() << "\n";
         return 1;
     }
 
-    std::cout << ">>> Running Phase 1 Baseline Clean DSP Benchmark for 5 seconds...\n";
+    std::cout << ">>> Running Phase 3 Heap Stress Benchmark for 10 seconds...\n";
     std::vector<CallbackTelemetry> collectedTelemetry;
-    collectedTelemetry.reserve(10000);
+    collectedTelemetry.reserve(20000);
 
     const auto benchmarkStart = std::chrono::steady_clock::now();
-    const auto benchmarkDuration = std::chrono::seconds(5);
+    const auto benchmarkDuration = std::chrono::seconds(10);
 
     // Main thread consumer loop (drains the lock-free SPSC queue periodically)
     while (std::chrono::steady_clock::now() - benchmarkStart < benchmarkDuration) {
@@ -208,6 +242,7 @@ int main() {
         collectedTelemetry.push_back(item);
     }
 
+    poisoner.stopBackgroundChurn();
     // Stop and clean up audio stream
     dac.stopStream();
     if (dac.isStreamOpen()) {

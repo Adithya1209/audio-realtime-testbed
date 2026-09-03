@@ -21,6 +21,9 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 # Build
 cmake --build build --config Release
 
-# Run
+# Run (Linux / macOS)
+./build/audio_testbed
+
+# Run (Windows)
 ./build/Release/audio_testbed.exe
 ```
