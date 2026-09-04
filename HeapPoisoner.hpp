@@ -5,6 +5,7 @@
 #include <string>
 #include <atomic>
 #include <thread>
+#include <algorithm>
 #include <random>
 #include <cstdlib>   // for malloc, free
 #include <cstring>   // for memset (touching memory pages)
@@ -13,17 +14,29 @@
 class HeapPoisoner {
 
 public:
+    enum class Strategy {
+        Strided, // baseline checkerboard
+        AdversarialISMM26 // Van Kempen & Berger (ISMM'26)
+    };
+
     struct Config {
+        Strategy strategy = Strategy::AdversarialISMM26;
+
+        // Nicolas' Algorithm 3 settings:
+        size_t peakAllocations = 25000;
+        double multiplier = 3.0;        // Adv3 setting 
+        double occupancy = 0.66;        // 66% pinned in memory (Adv3 setting)
+        unsigned int randomSeed = 42;   // Detereministic seed for reproducable shuffle
+
+        // Strided settings:
         size_t totalAllocations = 80000; // total blocks to allocate in the setup phase
+        size_t freeStride = 2; // Deallocation stride
 
         // A list of heterogeneous sizes (in bytes) spanning across:
         // - Tcache / Fastbins: 32B, 64B, 128B
         // - Small bins: 256B, 512B, 1024B
         // - Large bins & Page size: 2048B, 4096B, 8192B
         std::vector<size_t> sizeClasses = {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192};
-
-        // Deallocation stride
-        size_t freeStride = 2;
     };
 
     ~HeapPoisoner (){
@@ -31,42 +44,88 @@ public:
     }
 
     void fragmentHeap(const Config& config){
-        std::cout << "[HeapPoisoner] Starting heap fragmentation...\n";
+        if(config.strategy == Strategy::Strided){
+            std::cout << "[HeapPoisoner] Starting heap fragmentation...\n";
 
-        std::vector<void*> allAllocations;
-        allAllocations.reserve(config.totalAllocations);
-        
-        // Allocate and touch
-        for(size_t i=0; i<config.totalAllocations; ++i){
-            // Pick a size
-            size_t size = config.sizeClasses[i%config.sizeClasses.size()];
+            std::vector<void*> allAllocations;
+            allAllocations.reserve(config.totalAllocations);
+            
+            // Allocate and touch
+            for(size_t i=0; i<config.totalAllocations; ++i){
+                // Pick a size
+                size_t size = config.sizeClasses[i%config.sizeClasses.size()];
 
-            // Allocate memory
-            void* ptr = std::malloc(size);
-            if(!ptr) continue;
+                // Allocate memory
+                void* ptr = std::malloc(size);
+                if(!ptr) continue;
 
-            // Touch the memory so the OS maps physical RAM pages
-            std::memset(ptr, 0xA5, size);
+                // Touch the memory so the OS maps physical RAM pages
+                std::memset(ptr, 0xA5, size);
 
-            allAllocations.push_back(ptr);
+                allAllocations.push_back(ptr);
+            }
+
+            // Punching holes (Strided deallocation)
+            pinnedBlocks_.reserve(config.totalAllocations / config.freeStride +1);
+
+            for(size_t i=0; i<allAllocations.size(); ++i){
+                if(i%config.freeStride == 0){
+                    // Free this block which creates a hole in ptmalloc bins
+                    std::free(allAllocations[i]);
+                } else{
+                    // Keep this block pinned to prevent coalescing
+                    pinnedBlocks_.push_back(allAllocations[i]);
+                }
+            }
+
+            std::cout << "[HeapPoisoner] Poisoning complete. Pinned blocks: " 
+                    << pinnedBlocks_.size() << " | Freed holes: " 
+                    << (allAllocations.size() - pinnedBlocks_.size()) << "\n";
         }
+        else if(config.strategy == Strategy::AdversarialISMM26){
+            std::cout << "[HeapPoisoner] Running ISMM '26 Adversarial Allocation (Algorithm 3)...\n";
+            std::cout << "  - Multiplier: " << config.multiplier << " | Occupancy: " << (config.occupancy * 100.0) << "%\n";
 
-        // Punching holes (Strided deallocation)
-        pinnedBlocks_.reserve(config.totalAllocations / config.freeStride +1);
+            // Total allocations
+            size_t n = static_cast<size_t>(config.multiplier * static_cast<double>(config.peakAllocations));
 
-        for(size_t i=0; i<allAllocations.size(); ++i){
-            if(i%config.freeStride == 0){
-                // Free this block which creates a hole in ptmalloc bins
+            std::vector<void*> allAllocations;
+            allAllocations.reserve(n);
+
+            //PRNG for sampling sizes and shuffling
+            std::mt19937 rng(config.randomSeed);
+            std::uniform_int_distribution<size_t> dist(0, config.sizeClasses.size() - 1);
+
+            // Allocate and touch
+            for(size_t i = 0; i < n; ++i){
+                size_t size = config.sizeClasses[dist(rng)];
+                void* ptr = std::malloc(size);
+                if(ptr) {
+                    std::memset(ptr, 0xA5, size);
+                    allAllocations.push_back(ptr);
+                }
+            }
+
+            // Shuffle pointers uniformly
+            std::shuffle(allAllocations.begin(), allAllocations.end(), rng);
+
+            // Free fraction (1 - occupancy)
+            size_t numToFree = static_cast<size_t>(static_cast<double> (allAllocations.size())*(1.0 - config.occupancy));
+
+            for(size_t i = 0; i < numToFree; ++i){
                 std::free(allAllocations[i]);
-            } else{
-                // Keep this block pinned to prevent coalescing
+            }
+
+            // Retain remaining pointers as pinned blocks
+            pinnedBlocks_.reserve(allAllocations.size() - numToFree);
+            for(size_t i = numToFree; i < allAllocations.size(); ++i){
                 pinnedBlocks_.push_back(allAllocations[i]);
             }
-        }
 
-        std::cout << "[HeapPoisoner] Poisoning complete. Pinned blocks: " 
-                  << pinnedBlocks_.size() << " | Freed holes: " 
-                  << (allAllocations.size() - pinnedBlocks_.size()) << "\n";
+            std::cout << "[HeapPoisoner] Adversarial preconditioning complete.\n"
+                      << "  - Pinned (Live): " << pinnedBlocks_.size() 
+                      << " | Scattered Holes (Freed): " << numToFree << "\n";
+        }
     }
     
     void cleanup() {

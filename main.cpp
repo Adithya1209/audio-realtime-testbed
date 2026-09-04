@@ -168,8 +168,10 @@ int main() {
     poisoner.printHeapStats("Baseline (Before Poisoning)");
 
     HeapPoisoner::Config poisonConfig;
-    poisonConfig.totalAllocations = 100000;
-    poisonConfig.freeStride = 2;
+    // poisonConfig.totalAllocations = 100000;
+    // poisonConfig.freeStride = 2;
+
+    poisonConfig.strategy = HeapPoisoner::Strategy::AdversarialISMM26;    
 
     poisoner.fragmentHeap(poisonConfig);
     poisoner.printHeapStats("After Heap Poisoning");
