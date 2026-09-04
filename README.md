@@ -19,7 +19,7 @@ While pre-allocating all memory statically works well for fixed pipelines, moder
 ### Research Questions
 1. How do general-purpose memory allocators (`glibc ptmalloc`) behave inside hard real-time loops when the heap is fragmented and other threads are active?
 2. What causes deadline misses: free-list search overhead, memory fragmentation, or thread lock contention?
-3. Can a bounded $O(1)$ Region / Arena Allocator provide sufficient determinism to safely permit dynamic allocations in the critical path?
+3. Can a bounded O(1) Region / Arena Allocator provide sufficient determinism to safely permit dynamic allocations in the critical path?
 
 ---
 
@@ -43,17 +43,17 @@ The testbed is written in C++20 on Linux (ALSA backend via RtAudio) and consists
 To test allocator behavior under realistic conditions rather than a pristine heap, we implemented the stochastic heap preconditioning algorithm from *van Kempen & Berger (ISMM '26, Algorithm 3)* in [`HeapPoisoner.hpp`](HeapPoisoner.hpp):
 
 1. **Allocation & Page Touch:**  
-   Allocates $N = M \times \text{peak\_allocations}$ objects, sampling uniformly across 9 size classes (32B to 8192B). Memory is touched (`memset`) to ensure physical RAM pages are committed by the OS kernel.
+   Allocates `N = multiplier × peak_allocations` objects, sampling uniformly across 9 size classes (32B to 8192B). Memory is touched (`memset`) to ensure physical RAM pages are committed by the OS kernel.
 2. **Uniform Shuffle:**  
    The array of allocated pointers is randomized in-place using `std::shuffle` driven by a seeded Mersenne Twister (`std::mt19937`, seed 42) for scientific reproducibility.
 3. **Occupancy-Based Deallocation:**  
-   Frees $N \times (1 - O)$ pointers from the shuffled list, leaving $N \times O$ blocks pinned to prevent chunk coalescing.
+   Frees `N × (1 - Occupancy)` pointers from the shuffled list, leaving `N × Occupancy` blocks pinned to prevent chunk coalescing.
 
 ### Evaluated Presets (from Table 3 of the ISMM '26 paper):
-- **`adv0`:** Clean baseline ($M = 0$, preconditioning skipped).
-- **`adv1`:** Mild fragmentation ($M = 1.0$, Occupancy = 33%).
-- **`adv3`:** Moderate fragmentation ($M = 3.0$, Occupancy = 66%).
-- **`adv10`:** Heavy fragmentation ($M = 10.0$, Occupancy = 80%).
+- **`adv0`:** Clean baseline (Multiplier = 0, preconditioning skipped).
+- **`adv1`:** Mild fragmentation (Multiplier = 1.0, Occupancy = 33%).
+- **`adv3`:** Moderate fragmentation (Multiplier = 3.0, Occupancy = 66%).
+- **`adv10`:** Heavy fragmentation (Multiplier = 10.0, Occupancy = 80%).
 
 The testbed also retains a synthetic **Strided** checkerboard method (`i % 2 == 0`) for baseline comparison.
 
@@ -78,7 +78,7 @@ We executed an automated sweep across all ISMM '26 presets with 2 background thr
 
 Data from [`results.csv`](results.csv) (10 seconds per run, 128 frames @ 48 kHz):
 
-| Preset | Multiplier ($M$) | Occupancy ($O$) | Churn Threads | Underruns (Glitches) | P50 Latency | P99 Tail | Worst-Case Max | Heap Footprint / Free Holes | Status |
+| Preset | Multiplier (M) | Occupancy (O) | Churn Threads | Underruns (Glitches) | P50 Latency | P99 Tail | Worst-Case Max | Heap Footprint / Free Holes | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **adv0** | 0.00 | – | 2 | **4** | 6.11 µs | 18.20 µs | 170.78 µs | 0.33 MB / 184 holes | FAILED |
 | **adv0** | 0.00 | – | 2 | **20** | 8.98 µs | 15.17 µs | 55.86 µs | 0.33 MB / 184 holes | FAILED |
@@ -102,7 +102,7 @@ Data from [`results.csv`](results.csv) (10 seconds per run, 128 frames @ 48 kHz)
 We have demonstrated that general-purpose multi-threaded dynamic allocation cannot satisfy hard real-time guarantees under heap fragmentation and concurrent thread activity.
 
 **Current Work (Phase 4):**
-- Implement an $O(1)$ Region / Arena Allocator (Algorithms 1 & 2 from *van Kempen & Berger*).
+- Implement an O(1) Region / Arena Allocator (Algorithms 1 & 2 from *van Kempen & Berger*).
 - Route hot-path temporary scratch allocations through the Arena while keeping the heap poisoned under `adv10` and background churn active.
 - Verify whether constant-time allocation eliminates all hardware buffer underruns, returning the system to 0 glitches.
 
