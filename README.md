@@ -25,15 +25,17 @@ While pre-allocating all memory statically works well for fixed pipelines, moder
 
 ## 2. System Architecture
 
-The testbed is written in C++20 on Linux (ALSA backend via RtAudio) and consists of three components:
+The testbed is written in C++20 on Linux (ALSA backend via RtAudio) and consists of four distinct components:
 
 1. **Hard Real-Time Audio Loop:**  
-   A high-priority thread driven by the hardware soundcard (128 frames @ 48 kHz, ~2.67 ms deadline budget). Each callback optionally performs dynamic allocations of varying sizes (512B to 8192B) to simulate hot-path scratch memory.
-2. **Lock-Free Telemetry Pipeline:**  
+   A high-priority thread driven by the hardware soundcard (128 frames @ 48 kHz, ~2.67 ms deadline budget). Each callback performs dynamic allocations of varying sizes (512B to 8192B) to simulate real-time scratch buffers (e.g., intermediate tensor math or filter states).
+2. **Concurrent Background Churn Workers:**  
+   Separate background worker threads that continuously allocate, touch, and free memory of varying sizes (64B to 64KB). This simulates non-real-time application activity in a DAW or game (e.g., UI rendering, disk sample streaming, networking) and induces lock contention on shared `glibc` memory arenas.
+3. **Lock-Free Telemetry Pipeline:**  
    Execution durations are measured with high-resolution clocks and pushed into a custom Single-Producer Single-Consumer (`SPSCQueue`) ring buffer.
    - Cache-line separation (`alignas(64)`) on head and tail pointers prevents false sharing.
    - Atomic acquire-release semantics ensure wait-free operation on the audio thread.
-3. **Asynchronous Cold-Path Logging:**  
+4. **Asynchronous Cold-Path Logging:**  
    The main thread drains the telemetry queue periodically. After audio processing finishes, the main thread computes statistical percentiles (P50, P90, P99, P99.9, Worst-case) and appends the run to `results.csv`. The time-critical thread performs no disk I/O, console logging, or mutex synchronization.
 
 ---
