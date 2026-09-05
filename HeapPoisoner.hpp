@@ -7,118 +7,105 @@
 #include <thread>
 #include <algorithm>
 #include <random>
-#include <cstdlib>   // for malloc, free
-#include <cstring>   // for memset (touching memory pages)
-#include <malloc.h>  // for Linux/glibc mallinfo2()
+#include <cstdlib>
+#include <cstring>
+#include <malloc.h> // glibc mallinfo2() heap diagnostic API
 
 class HeapPoisoner {
 
 public:
     enum class Strategy {
-        Strided, // baseline checkerboard
-        AdversarialISMM26 // Van Kempen & Berger (ISMM'26)
+        Strided,          // Baseline alternating checkerboard
+        AdversarialISMM26 // Stochastic preconditioning (van Kempen & Berger, ISMM '26 Algorithm 3)
     };
 
     struct Config {
         Strategy strategy = Strategy::AdversarialISMM26;
 
-        // Nicolas' Algorithm 3 settings:
+        // ISMM '26 Algorithm 3 Parameters (Table 3):
         size_t peakAllocations = 25000;
-        double multiplier = 3.0;        // Adv3 setting 
-        double occupancy = 0.66;        // 66% pinned in memory (Adv3 setting)
-        unsigned int randomSeed = 42;   // Detereministic seed for reproducable shuffle
+        double multiplier = 3.0;      // Adv3 setting: Footprint expansion factor
+        double occupancy = 0.66;      // Adv3 setting: Fraction of surviving live blocks
+        unsigned int randomSeed = 42; // Seed for reproducible Mersenne Twister PRNG
 
-        // Strided settings:
-        size_t totalAllocations = 80000; // total blocks to allocate in the setup phase
-        size_t freeStride = 2; // Deallocation stride
+        // Strided baseline parameters:
+        size_t totalAllocations = 80000;
+        size_t freeStride = 2;
 
-        // A list of heterogeneous sizes (in bytes) spanning across:
-        // - Tcache / Fastbins: 32B, 64B, 128B
-        // - Small bins: 256B, 512B, 1024B
-        // - Large bins & Page size: 2048B, 4096B, 8192B
+        // Power-of-two size classes spanning tcache, fastbins, small bins, and large bins
         std::vector<size_t> sizeClasses = {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192};
     };
 
-    ~HeapPoisoner (){
+    ~HeapPoisoner() {
         cleanup();
     }
 
-    void fragmentHeap(const Config& config){
-        if(config.strategy == Strategy::Strided){
-            std::cout << "[HeapPoisoner] Starting heap fragmentation...\n";
+    void fragmentHeap(const Config& config) {
+        if (config.strategy == Strategy::Strided) {
+            std::cout << "[HeapPoisoner] Starting heap fragmentation (Strided Checkerboard)...\n";
 
             std::vector<void*> allAllocations;
             allAllocations.reserve(config.totalAllocations);
             
-            // Allocate and touch
-            for(size_t i=0; i<config.totalAllocations; ++i){
-                // Pick a size
-                size_t size = config.sizeClasses[i%config.sizeClasses.size()];
-
-                // Allocate memory
+            for (size_t i = 0; i < config.totalAllocations; ++i) {
+                size_t size = config.sizeClasses[i % config.sizeClasses.size()];
                 void* ptr = std::malloc(size);
-                if(!ptr) continue;
+                if (!ptr) continue;
 
-                // Touch the memory so the OS maps physical RAM pages
+                // memset forces kernel physical page mapping (avoids zero-page virtual-only allocation)
                 std::memset(ptr, 0xA5, size);
-
                 allAllocations.push_back(ptr);
             }
 
-            // Punching holes (Strided deallocation)
-            pinnedBlocks_.reserve(config.totalAllocations / config.freeStride +1);
+            pinnedBlocks_.reserve(config.totalAllocations / config.freeStride + 1);
 
-            for(size_t i=0; i<allAllocations.size(); ++i){
-                if(i%config.freeStride == 0){
-                    // Free this block which creates a hole in ptmalloc bins
+            for (size_t i = 0; i < allAllocations.size(); ++i) {
+                if (i % config.freeStride == 0) {
                     std::free(allAllocations[i]);
-                } else{
-                    // Keep this block pinned to prevent coalescing
+                } else {
+                    // Pinned blocks maintain PREV_INUSE neighbor bits to suppress chunk coalescing
                     pinnedBlocks_.push_back(allAllocations[i]);
                 }
             }
 
             std::cout << "[HeapPoisoner] Poisoning complete. Pinned blocks: " 
-                    << pinnedBlocks_.size() << " | Freed holes: " 
-                    << (allAllocations.size() - pinnedBlocks_.size()) << "\n";
+                      << pinnedBlocks_.size() << " | Freed holes: " 
+                      << (allAllocations.size() - pinnedBlocks_.size()) << "\n";
         }
-        else if(config.strategy == Strategy::AdversarialISMM26){
+        else if (config.strategy == Strategy::AdversarialISMM26) {
             std::cout << "[HeapPoisoner] Running ISMM '26 Adversarial Allocation (Algorithm 3)...\n";
             std::cout << "  - Multiplier: " << config.multiplier << " | Occupancy: " << (config.occupancy * 100.0) << "%\n";
 
-            // Total allocations
             size_t n = static_cast<size_t>(config.multiplier * static_cast<double>(config.peakAllocations));
 
             std::vector<void*> allAllocations;
             allAllocations.reserve(n);
 
-            //PRNG for sampling sizes and shuffling
             std::mt19937 rng(config.randomSeed);
             std::uniform_int_distribution<size_t> dist(0, config.sizeClasses.size() - 1);
 
-            // Allocate and touch
-            for(size_t i = 0; i < n; ++i){
+            // Sample heterogeneous sizes and commit physical pages
+            for (size_t i = 0; i < n; ++i) {
                 size_t size = config.sizeClasses[dist(rng)];
                 void* ptr = std::malloc(size);
-                if(ptr) {
+                if (ptr) {
                     std::memset(ptr, 0xA5, size);
                     allAllocations.push_back(ptr);
                 }
             }
 
-            // Shuffle pointers uniformly
+            // Uniform Fisher-Yates shuffle across allocated addresses
             std::shuffle(allAllocations.begin(), allAllocations.end(), rng);
 
-            // Free fraction (1 - occupancy)
-            size_t numToFree = static_cast<size_t>(static_cast<double> (allAllocations.size())*(1.0 - config.occupancy));
+            // Deallocate (1 - occupancy) fraction; retain surviving blocks to break spatial cache locality
+            size_t numToFree = static_cast<size_t>(static_cast<double>(allAllocations.size()) * (1.0 - config.occupancy));
 
-            for(size_t i = 0; i < numToFree; ++i){
+            for (size_t i = 0; i < numToFree; ++i) {
                 std::free(allAllocations[i]);
             }
 
-            // Retain remaining pointers as pinned blocks
             pinnedBlocks_.reserve(allAllocations.size() - numToFree);
-            for(size_t i = numToFree; i < allAllocations.size(); ++i){
+            for (size_t i = numToFree; i < allAllocations.size(); ++i) {
                 pinnedBlocks_.push_back(allAllocations[i]);
             }
 
@@ -152,41 +139,40 @@ public:
         std::cout << "-------------------------------------------\n";
     }
 
-    void startBackgroundChurn(size_t numThreads = 2){
-        if(churnRunning_.load()) return;
+    // Multi-threaded churn simulating concurrent process activity (e.g. GUI rendering, sample streaming)
+    void startBackgroundChurn(size_t numThreads = 2) {
+        if (churnRunning_.load()) return;
         churnRunning_.store(true);
 
-        std::cout<< "[HeapPoisoner] Starting" << numThreads << " background heap churn thread(s)";
+        std::cout << "[HeapPoisoner] Starting " << numThreads << " background heap churn thread(s)...\n";
 
-        for(size_t t = 0; t < numThreads; ++t){
+        for (size_t t = 0; t < numThreads; ++t) {
             churnWorkers_.emplace_back([this, t]() {
                 const size_t churnSizes[] = {64, 256, 1024, 4096, 16384, 65536};
                 std::vector<void*> tempBlocks(16, nullptr);
 
                 size_t counter = t;
-                while(churnRunning_.load(std::memory_order_relaxed)){
-                    // Allocate a batch of varied blocks
-                    for(size_t i = 0; i<tempBlocks.size(); ++i){
+                while (churnRunning_.load(std::memory_order_relaxed)) {
+                    for (size_t i = 0; i < tempBlocks.size(); ++i) {
                         size_t sz = churnSizes[(counter + i) % 6];
                         tempBlocks[i] = std::malloc(sz);
-                        if(tempBlocks[i]) std::memset(tempBlocks[i], 0x55, sz); // Touch memory and cache
+                        if (tempBlocks[i]) std::memset(tempBlocks[i], 0x55, sz);
                     }
 
-                    for(size_t i = 0; i <tempBlocks.size(); ++i){
-                        if(tempBlocks[i]){
+                    for (size_t i = 0; i < tempBlocks.size(); ++i) {
+                        if (tempBlocks[i]) {
                             std::free(tempBlocks[i]);
                             tempBlocks[i] = nullptr;
                         }
                     }
                     counter++;
 
-                    // Yield CPU briefly to prevent burning 100% CPU on worker cores
-                    std::this_thread::yield(); 
+                    // Yield CPU to maintain scheduler fairness while maintaining continuous arena mutex contention
+                    std::this_thread::yield();
                 }
 
-                // Cleanup any remaining temporary allocations
-                for( void* p: tempBlocks){
-                    if(p) std::free(p);
+                for (void* p : tempBlocks) {
+                    if (p) std::free(p);
                 }
             });
         }

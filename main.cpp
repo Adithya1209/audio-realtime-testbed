@@ -28,10 +28,9 @@ struct AudioContext {
     double sampleRate = 48000.0;
     SPSCQueue<CallbackTelemetry, 65536> telemetryQueue;
 
-    // Stress Test Controls:
-    bool stressHeap = true;              // Enable/disable hot-path malloc
-    size_t numAllocationsPerCallback = 4; // Simulate 4 temporary scratch buffers
-    size_t allocationSizeBytes = 4096;    // 1024 bytes each (total 4KB per block)
+    bool stressHeap = true;
+    size_t numAllocationsPerCallback = 4;
+    size_t allocationSizeBytes = 4096;
 };
 
 struct BenchmarkConfig {
@@ -124,14 +123,14 @@ BenchmarkConfig parseCommandLine(int argc, char* argv[]) {
     return cfg;
 }
 
-// The Hard Real-Time Audio Callback (The Hot Path)
+// Hard real-time audio callback: invoked by ALSA driver at fixed 2.67 ms intervals (128 frames @ 48 kHz)
 int audioCallback(void* outputBuffer, void* /*inputBuffer*/, unsigned int nBufferFrames,
                   double /*streamTime*/, RtAudioStreamStatus status, void* userData) {
 
     const auto startTime = std::chrono::steady_clock::now();
     auto* ctx = static_cast<AudioContext*>(userData);
 
-    // --- HEAP ALLOCATION STRESS TEST ---
+    // Hot-path memory stress: evaluates dynamic allocation latency under adversarial fragmentation
     if (ctx->stressHeap) {
         static const size_t stressSizes[4] = {512, 2048, 4096, 8192};
         constexpr size_t MAX_SCRATCH = 32;
@@ -155,11 +154,10 @@ int audioCallback(void* outputBuffer, void* /*inputBuffer*/, unsigned int nBuffe
 
     const double phaseIncrement = 2.0 * PI * ctx->frequency / ctx->sampleRate;
 
-    // Generate Stereo Sine Wave (Zero-Allocation Hot Path)
     for (unsigned int i = 0; i < nBufferFrames; ++i) {
-        float sample = static_cast<float>(std::sin(ctx->phase) * 0.25); // Volume at 25%
-        *buffer++ = sample; // Left
-        *buffer++ = sample; // Right
+        float sample = static_cast<float>(std::sin(ctx->phase) * 0.25);
+        *buffer++ = sample;
+        *buffer++ = sample;
 
         ctx->phase += phaseIncrement;
         if (ctx->phase >= 2.0 * PI) {
@@ -349,7 +347,7 @@ int main(int argc, char* argv[]) {
         std::cout << "[HeapPoisoner] Heap preconditioning skipped (clean baseline)\n";
     }
 
-    // Allocate AudioContext on the Heap to prevent stack overflow from 1MB queue buffer
+    // Pre-allocated AudioContext on heap to prevent thread stack exhaustion from internal SPSC queue
     auto ctx = std::make_unique<AudioContext>();
     ctx->stressHeap = cfg.stressHeap;
     ctx->numAllocationsPerCallback = cfg.numAllocationsPerCallback;
@@ -357,7 +355,7 @@ int main(int argc, char* argv[]) {
     unsigned int sampleRate = static_cast<unsigned int>(info.preferredSampleRate > 0 ? info.preferredSampleRate : 48000);
     ctx->sampleRate = static_cast<double>(sampleRate);
 
-    unsigned int bufferFrames = 128; // 128 frames @ 48kHz = ~2.666 ms budget
+    unsigned int bufferFrames = 128; // 128 frames @ 48kHz = 2.666 ms hard real-time deadline budget
 
     RtAudio::StreamParameters parameters;
     parameters.deviceId = defaultDevice;
@@ -365,9 +363,8 @@ int main(int argc, char* argv[]) {
     parameters.firstChannel = 0;
 
     RtAudio::StreamOptions options;
-    options.flags = RTAUDIO_MINIMIZE_LATENCY;
+    options.flags = RTAUDIO_MINIMIZE_LATENCY; // Enforce minimum ALSA period size for low-latency operation
 
-    // Open Stream
     RtAudioErrorType err = dac.openStream(
         &parameters,
         nullptr,
@@ -407,7 +404,7 @@ int main(int argc, char* argv[]) {
     const auto benchmarkStart = std::chrono::steady_clock::now();
     const auto benchmarkDuration = std::chrono::seconds(cfg.durationSeconds);
 
-    // Main thread consumer loop (drains the lock-free SPSC queue periodically)
+    // Asynchronously drain telemetry queue on main thread during benchmark execution
     while (std::chrono::steady_clock::now() - benchmarkStart < benchmarkDuration) {
         CallbackTelemetry item;
         while (ctx->telemetryQueue.pop(item)) {
@@ -416,7 +413,6 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 
-    // Drain any remaining telemetry items in the queue
     CallbackTelemetry item;
     while (ctx->telemetryQueue.pop(item)) {
         collectedTelemetry.push_back(item);
@@ -426,14 +422,14 @@ int main(int argc, char* argv[]) {
         poisoner.stopBackgroundChurn();
     }
 
-    // Stop and clean up audio stream
     dac.stopStream();
     if (dac.isStreamOpen()) {
         dac.closeStream();
     }
 
-    // Process and print telemetry report
     printBenchmarkReport(collectedTelemetry, budgetMs);
+
+    // Cold-path CSV export executed strictly after stream termination to guarantee zero real-time disk I/O
     appendToCSV(cfg.csvPath, cfg, collectedTelemetry, budgetMs);
 
     return 0;
