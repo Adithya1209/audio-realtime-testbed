@@ -75,7 +75,7 @@ All tests were conducted on Linux (EndeavourOS, kernel 6.x, GCC 16, ALSA output,
 - **Result:** 0 hardware underruns, mean latency rose from 10.3 µs to 17.1 µs (+66%).
 - **Observation (The "Tcache Illusion"):** When allocation patterns repeat without contention, `glibc` thread-local caching (tcache and fastbins) recycles chunks in L1/L2 cache, partially masking the underlying heap fragmentation.
 
-#### C. Phase 3: Concurrent Allocation & Adversarial Stress Sweep (`glibc malloc`)
+### C. Phase 3: Concurrent Allocation & Adversarial Stress Sweep (`glibc malloc`)
 To rigorously evaluate general-purpose `glibc malloc` under multi-threaded contention and heap fragmentation, we executed an automated stress sweep across all ISMM '26 fragmentation presets (`adv0`, `adv1`, `adv3`, `adv10`) and allocation densities ($a \in \{4, 8, 16\}$ blocks per callback, sized 1.5 KB to 16 KB).
 
 **Experimental Controls:**
