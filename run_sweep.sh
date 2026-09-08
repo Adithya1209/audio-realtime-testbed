@@ -1,36 +1,48 @@
 #!/bin/bash
 set -e
 
-RESULTS="results.csv"
-DURATION=${1:-10}
-ITERATIONS=${2:-3}
-CHURN=${3:-2}
-ALLOCS=${4:-4}
+RESULTS="${1:-results.csv}"
+DURATION="${2:-10}"
+CHURN="${3:-2}"
+DEVICE="${4:-""}"
+
+DEVICE_FLAG=""
+if [ -n "$DEVICE" ]; then
+    DEVICE_FLAG="-D $DEVICE"
+fi
 
 echo "================================================================="
 echo "  Hard Real-Time Audio DSP Testbed - Automated Benchmark Sweep   "
 echo "================================================================="
-echo "Target Platform : elpatr0n (EndeavourOS / ALSA)"
+echo "Target Platform : Linux (ALSA backend)"
 echo "Output File     : $RESULTS"
 echo "Run Duration    : ${DURATION}s per test"
-echo "Iterations      : $ITERATIONS per preset"
-echo "Churn Workers   : $CHURN"
-echo "Allocs / Frame  : $ALLOCS"
+echo "Churn Workers   : $CHURN (SCHED_IDLE + nice = +19 background priority)"
+echo "Presets to Test : adv0 adv1 adv3 adv10"
+echo "Allocs / Frame  : 4 8 16"
+if [ -n "$DEVICE" ]; then
+    echo "Audio Device ID : $DEVICE (Hardware Override Active)"
+else
+    echo "Audio Device ID : System Default"
+fi
 echo "================================================================="
 
-# Array of presets to sweep
 PRESETS=("adv0" "adv1" "adv3" "adv10")
+ALLOC_COUNTS=(4 8 16)
+
+TOTAL_RUNS=$((${#PRESETS[@]} * ${#ALLOC_COUNTS[@]}))
+RUN_INDEX=0
 
 for PRESET in "${PRESETS[@]}"; do
-    echo ""
-    echo ">> ========================================================="
-    echo ">> [SWEEP] Testing Preset: $PRESET"
-    echo ">> ========================================================="
-    
-    for i in $(seq 1 $ITERATIONS); do
-        echo "   -> Running Iteration $i of $ITERATIONS for $PRESET..."
-        ./build/audio_testbed -p "$PRESET" -d "$DURATION" -c "$CHURN" -a "$ALLOCS" -f "$RESULTS"
-        sleep 1 # 1s cool-down between runs
+    for ALLOCS in "${ALLOC_COUNTS[@]}"; do
+        RUN_INDEX=$((RUN_INDEX + 1))
+        echo ""
+        echo ">> ========================================================="
+        echo ">> [$RUN_INDEX/$TOTAL_RUNS] Preset: $PRESET | Allocs/Callback: $ALLOCS [glibc malloc]"
+        echo ">> ========================================================="
+        
+        ./build/audio_testbed $DEVICE_FLAG -p "$PRESET" -d "$DURATION" -c "$CHURN" -a "$ALLOCS" -f "$RESULTS"
+        sleep 2
     done
 done
 

@@ -11,6 +11,7 @@
 #include <getopt.h>
 #include <fstream>
 #include <filesystem>
+#include <malloc.h>
 #include "RtAudio.h"
 #include "SPSCQueue.hpp"
 #include "HeapPoisoner.hpp"
@@ -18,7 +19,8 @@
 constexpr double PI = 3.14159265358979323846;
 
 struct CallbackTelemetry {
-    uint64_t duration_ns;
+    uint64_t duration_ns;      // Hot-path execution time inside callback (T_exec)
+    uint64_t inter_arrival_ns; // Inter-arrival time between consecutive callbacks (T_interval)
     bool is_underflow;
 };
 
@@ -31,6 +33,32 @@ struct AudioContext {
     bool stressHeap = true;
     size_t numAllocationsPerCallback = 4;
     size_t allocationSizeBytes = 4096;
+
+    size_t callbackCount = 0;
+    size_t warmupCallbacks = 40; // Discard first ~106 ms of stream startup transients
+
+    std::chrono::steady_clock::time_point lastCallbackTime{};
+    bool hasLastCallbackTime = false;
+
+    // Sliding-window history buffer: holds blocks alive across 8 callbacks (~21 ms)
+    // to simulate real DSP history (delay lines, FIR filters, FFT overlap-add)
+    // and defeat immediate glibc tcache recycling
+    static constexpr size_t HISTORY_WINDOW = 8;
+    static constexpr size_t MAX_SCRATCH = 32;
+    void* historyBlocks[HISTORY_WINDOW][MAX_SCRATCH] = {{nullptr}};
+    size_t historyAllocCounts[HISTORY_WINDOW] = {0};
+    size_t historyIndex = 0;
+
+    ~AudioContext() {
+        for (size_t w = 0; w < HISTORY_WINDOW; ++w) {
+            for (size_t a = 0; a < MAX_SCRATCH; ++a) {
+                if (historyBlocks[w][a]) {
+                    std::free(historyBlocks[w][a]);
+                    historyBlocks[w][a] = nullptr;
+                }
+            }
+        }
+    }
 };
 
 struct BenchmarkConfig {
@@ -53,6 +81,8 @@ struct BenchmarkConfig {
     size_t churnThreads = 2;
     unsigned int durationSeconds = 10;
     std::string csvPath = "";
+
+    int deviceId = -1; // -1 indicates system default device
 };
 
 BenchmarkConfig parseCommandLine(int argc, char* argv[]) {
@@ -69,12 +99,13 @@ BenchmarkConfig parseCommandLine(int argc, char* argv[]) {
         {"csv",        required_argument, 0, 'f'},
         {"no-stress",  no_argument,       0, 'n'},
         {"help",       no_argument,       0, 'h'},
+        {"device",     required_argument, 0, 'D'},
         {0, 0, 0, 0}
     };
 
     int opt;
     int option_index = 0;
-    while((opt = getopt_long(argc, argv, "p:m:o:c:a:d:s:f:nh", long_options, &option_index)) != -1) {
+    while((opt = getopt_long(argc, argv, "p:m:o:c:a:d:s:f:nhD:", long_options, &option_index)) != -1) {
         switch(opt) {
             case 'p':
                 cfg.preset = optarg;
@@ -104,6 +135,7 @@ BenchmarkConfig parseCommandLine(int argc, char* argv[]) {
             case 's': cfg.randomSeed = static_cast<unsigned int>(std::stoul(optarg)); break;
             case 'f': cfg.csvPath = optarg; break;
             case 'n': cfg.stressHeap = false; break;
+            case 'D': cfg.deviceId = std::stoi(optarg); break;
             case 'h':
             default:
                 std::cout << "Usage: " << argv[0] << " [options]\n"
@@ -116,6 +148,7 @@ BenchmarkConfig parseCommandLine(int argc, char* argv[]) {
                         << "  -s, --seed <int>                             PRNG shuffle seed (default 42)\n"
                         << "  -f, --csv <path>                             Append metrics to CSV file\n"
                         << "  -n, --no-stress                              Disable hot-path malloc\n"
+                        << "  -D, --device <id>                            Target specific audio hardware device ID\n"
                         << "  -h, --help                                   Show this help message\n";
                 std::exit(0);
         }
@@ -130,22 +163,46 @@ int audioCallback(void* outputBuffer, void* /*inputBuffer*/, unsigned int nBuffe
     const auto startTime = std::chrono::steady_clock::now();
     auto* ctx = static_cast<AudioContext*>(userData);
 
+    uint64_t interArrivalNs = 0;
+    if (ctx->hasLastCallbackTime) {
+        interArrivalNs = std::chrono::duration_cast<std::chrono::nanoseconds>(startTime - ctx->lastCallbackTime).count();
+    }
+    ctx->lastCallbackTime = startTime;
+    ctx->hasLastCallbackTime = true;
+
     // Hot-path memory stress: evaluates dynamic allocation latency under adversarial fragmentation
     if (ctx->stressHeap) {
-        static const size_t stressSizes[4] = {512, 2048, 4096, 8192};
-        constexpr size_t MAX_SCRATCH = 32;
-        size_t allocCount = std::min(ctx->numAllocationsPerCallback, MAX_SCRATCH);
-        void* scratchBlocks[MAX_SCRATCH] = {nullptr};
+        // Heterogeneous non-power-of-two DSP scratch sizes (delay buffers, FFT states, tensor scratchpads)
+        // Exceeds smallbin exact-match threshold (>1024B) to defeat trivial smallbin indexing and force large-bin tree searches
+        static const size_t stressSizes[] = {1536, 2752, 3840, 5120, 6400, 8960, 12288, 16384};
+        constexpr size_t numStressSizes = sizeof(stressSizes) / sizeof(stressSizes[0]);
 
-        for (size_t a = 0; a < allocCount; ++a) {
-            size_t sz = stressSizes[a % 4];
-            scratchBlocks[a] = std::malloc(sz);
-            if (scratchBlocks[a]) std::memset(scratchBlocks[a], 0, sz);
-        }
+        size_t allocCount = std::min(ctx->numAllocationsPerCallback, AudioContext::MAX_SCRATCH);
 
-        for (size_t a = 0; a < allocCount; ++a) {
-            if (scratchBlocks[a]) std::free(scratchBlocks[a]);
+        // 1. Free historical blocks from HISTORY_WINDOW callbacks ago (defeats immediate tcache recycling)
+        size_t oldestIdx = ctx->historyIndex;
+        for (size_t a = 0; a < ctx->historyAllocCounts[oldestIdx]; ++a) {
+            if (ctx->historyBlocks[oldestIdx][a]) {
+                std::free(ctx->historyBlocks[oldestIdx][a]);
+                ctx->historyBlocks[oldestIdx][a] = nullptr;
+            }
         }
+        ctx->historyAllocCounts[oldestIdx] = 0;
+
+        // 2. Allocate new blocks for current callback
+        for (size_t a = 0; a < allocCount; ++a) {
+            size_t sz = stressSizes[(ctx->callbackCount * allocCount + a) % numStressSizes];
+            void* ptr = std::malloc(sz);
+            if (ptr) {
+                // Touch cache lines at head and tail to guarantee physical page and cache footprint
+                auto* b = static_cast<char*>(ptr);
+                b[0] = 0x55;
+                b[sz - 1] = 0xAA;
+                ctx->historyBlocks[oldestIdx][a] = ptr;
+            }
+        }
+        ctx->historyAllocCounts[oldestIdx] = allocCount;
+        ctx->historyIndex = (ctx->historyIndex + 1) % AudioContext::HISTORY_WINDOW;
     }
 
     const bool underflow = (status & RTAUDIO_OUTPUT_UNDERFLOW) != 0;
@@ -168,8 +225,11 @@ int audioCallback(void* outputBuffer, void* /*inputBuffer*/, unsigned int nBuffe
     const auto endTime = std::chrono::steady_clock::now();
     const uint64_t elapsedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime).count();
 
-    CallbackTelemetry sample{elapsedNs, underflow};
-    ctx->telemetryQueue.push(sample);
+    ctx->callbackCount++;
+    if (ctx->callbackCount > ctx->warmupCallbacks) {
+        CallbackTelemetry sample{elapsedNs, interArrivalNs, underflow};
+        ctx->telemetryQueue.push(sample);
+    }
     return 0;
 }
 
@@ -180,11 +240,16 @@ void printBenchmarkReport(const std::vector<CallbackTelemetry>& telemetryData, d
     }
 
     std::vector<double> durationsUs;
+    std::vector<double> intervalsUs;
     durationsUs.reserve(telemetryData.size());
+    intervalsUs.reserve(telemetryData.size());
     uint64_t underflowCount = 0;
 
     for (const auto& entry : telemetryData) {
         durationsUs.push_back(static_cast<double>(entry.duration_ns) / 1000.0);
+        if (entry.inter_arrival_ns > 0) {
+            intervalsUs.push_back(static_cast<double>(entry.inter_arrival_ns) / 1000.0);
+        }
         if (entry.is_underflow) {
             underflowCount++;
         }
@@ -197,22 +262,42 @@ void printBenchmarkReport(const std::vector<CallbackTelemetry>& telemetryData, d
     double minVal = durationsUs.front();
     double maxVal = durationsUs.back();
     
-    auto getPercentile = [&](double p) -> double {
-        size_t idx = static_cast<size_t>(p * static_cast<double>(durationsUs.size() - 1));
-        return durationsUs[idx];
+    auto getPercentile = [](const std::vector<double>& vec, double p) -> double {
+        if (vec.empty()) return 0.0;
+        size_t idx = static_cast<size_t>(p * static_cast<double>(vec.size() - 1));
+        return vec[idx];
     };
 
-    double p50 = getPercentile(0.50);
-    double p90 = getPercentile(0.90);
-    double p99 = getPercentile(0.99);
-    double p999 = getPercentile(0.999);
+    double p50 = getPercentile(durationsUs, 0.50);
+    double p90 = getPercentile(durationsUs, 0.90);
+    double p99 = getPercentile(durationsUs, 0.99);
+    double p999 = getPercentile(durationsUs, 0.999);
 
     double budgetUs = budgetMs * 1000.0;
     double maxBudgetUtilization = (maxVal / budgetUs) * 100.0;
     double p99BudgetUtilization = (p99 / budgetUs) * 100.0;
 
+    // Interval / Jitter Telemetry
+    double meanInterval = 0.0;
+    double minInterval = 0.0;
+    double maxInterval = 0.0;
+    double p50Interval = 0.0;
+    double p99Interval = 0.0;
+    double p999Interval = 0.0;
+
+    if (!intervalsUs.empty()) {
+        std::sort(intervalsUs.begin(), intervalsUs.end());
+        double sumInterval = std::accumulate(intervalsUs.begin(), intervalsUs.end(), 0.0);
+        meanInterval = sumInterval / static_cast<double>(intervalsUs.size());
+        minInterval = intervalsUs.front();
+        maxInterval = intervalsUs.back();
+        p50Interval = getPercentile(intervalsUs, 0.50);
+        p99Interval = getPercentile(intervalsUs, 0.99);
+        p999Interval = getPercentile(intervalsUs, 0.999);
+    }
+
     std::cout << "\n========================================================\n";
-    std::cout << "         PHASE 1: BASELINE CLEAN DSP BENCHMARK          \n";
+    std::cout << "         HARD REAL-TIME AUDIO BENCHMARK REPORT          \n";
     std::cout << "========================================================\n";
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "Total Audio Callbacks Processed : " << telemetryData.size() << "\n";
@@ -224,7 +309,7 @@ void printBenchmarkReport(const std::vector<CallbackTelemetry>& telemetryData, d
     }
     std::cout << "Hard Real-Time Budget per Block : " << budgetUs << " us (" << budgetMs << " ms)\n";
     std::cout << "--------------------------------------------------------\n";
-    std::cout << "  Execution Latency Breakdown (Hot Path):\n";
+    std::cout << "  Execution Latency Breakdown (T_exec - Hot Path):\n";
     std::cout << "   - Min Latency                : " << std::setw(8) << minVal << " us\n";
     std::cout << "   - Mean Latency               : " << std::setw(8) << mean << " us\n";
     std::cout << "   - P50 (Median) Latency       : " << std::setw(8) << p50 << " us\n";
@@ -236,6 +321,19 @@ void printBenchmarkReport(const std::vector<CallbackTelemetry>& telemetryData, d
     std::cout << "  Budget Headroom & Utilization:\n";
     std::cout << "   - P99 Budget Utilization     : " << std::setw(8) << p99BudgetUtilization << " %\n";
     std::cout << "   - Worst-Case Utilization     : " << std::setw(8) << maxBudgetUtilization << " %\n";
+    std::cout << "--------------------------------------------------------\n";
+    std::cout << "  Inter-Callback Interval & Jitter (T_interval):\n";
+    std::cout << "   - Nominal Period             : " << std::setw(8) << budgetUs << " us\n";
+    std::cout << "   - Min Interval               : " << std::setw(8) << minInterval << " us\n";
+    std::cout << "   - Mean Interval              : " << std::setw(8) << meanInterval << " us\n";
+    std::cout << "   - P50 (Median) Interval      : " << std::setw(8) << p50Interval << " us\n";
+    std::cout << "   - P99 Tail Interval          : " << std::setw(8) << p99Interval << " us\n";
+    std::cout << "   - P99.9 Extreme Interval     : " << std::setw(8) << p999Interval << " us\n";
+    std::cout << "   - Worst-Case Interval (Max)  : " << std::setw(8) << maxInterval << " us\n";
+    if (maxInterval > budgetUs) {
+        std::cout << "   - Max Interval Overdue Gap   : +" << std::setw(7) << (maxInterval - budgetUs) << " us ("
+                  << (maxInterval / budgetUs * 100.0) << "% of budget)\n";
+    }
     std::cout << "========================================================\n\n";
 }
 
@@ -253,15 +351,21 @@ void appendToCSV(const std::string& csvPath, const BenchmarkConfig& cfg,
     // Write header if creating a new file
     if (!fileExists) {
         file << "preset,strategy,multiplier,occupancy,churn_threads,allocs_per_cb,duration_s,"
-                << "callbacks,underruns,min_us,mean_us,p50_us,p90_us,p99_us,p999_us,max_us,status\n";
+                << "callbacks,underruns,min_us,mean_us,p50_us,p90_us,p99_us,p999_us,max_us,"
+                << "mean_interval_us,p99_interval_us,max_interval_us,status\n";
     }
 
     std::vector<double> durationsUs;
+    std::vector<double> intervalsUs;
     durationsUs.reserve(telemetryData.size());
+    intervalsUs.reserve(telemetryData.size());
     uint64_t underflowCount = 0;
 
     for (const auto& entry : telemetryData) {
         durationsUs.push_back(static_cast<double>(entry.duration_ns) / 1000.0);
+        if (entry.inter_arrival_ns > 0) {
+            intervalsUs.push_back(static_cast<double>(entry.inter_arrival_ns) / 1000.0);
+        }
         if (entry.is_underflow) underflowCount++;
     }
 
@@ -271,17 +375,32 @@ void appendToCSV(const std::string& csvPath, const BenchmarkConfig& cfg,
     double minVal = durationsUs.front();
     double maxVal = durationsUs.back();
 
-    auto getPercentile = [&](double p) -> double {
-        size_t idx = static_cast<size_t>(p * static_cast<double>(durationsUs.size() - 1));
-        return durationsUs[idx];
+    auto getPercentile = [](const std::vector<double>& vec, double p) -> double {
+        if (vec.empty()) return 0.0;
+        size_t idx = static_cast<size_t>(p * static_cast<double>(vec.size() - 1));
+        return vec[idx];
     };
 
-    double p50 = getPercentile(0.50);
-    double p90 = getPercentile(0.90);
-    double p99 = getPercentile(0.99);
-    double p999 = getPercentile(0.999);
+    double p50 = getPercentile(durationsUs, 0.50);
+    double p90 = getPercentile(durationsUs, 0.90);
+    double p99 = getPercentile(durationsUs, 0.99);
+    double p999 = getPercentile(durationsUs, 0.999);
+
+    double meanInterval = 0.0;
+    double p99Interval = 0.0;
+    double maxInterval = 0.0;
+    if (!intervalsUs.empty()) {
+        std::sort(intervalsUs.begin(), intervalsUs.end());
+        double sumInterval = std::accumulate(intervalsUs.begin(), intervalsUs.end(), 0.0);
+        meanInterval = sumInterval / static_cast<double>(intervalsUs.size());
+        p99Interval = getPercentile(intervalsUs, 0.99);
+        maxInterval = intervalsUs.back();
+    }
 
     std::string stratName = (cfg.strategy == HeapPoisoner::Strategy::Strided) ? "Strided" : "ISMM26";
+    if (cfg.stressHeap) {
+        stratName += "+malloc";
+    }
     std::string status = (underflowCount == 0) ? "PASSED" : "FAILED";
 
     file << std::fixed << std::setprecision(2)
@@ -301,6 +420,9 @@ void appendToCSV(const std::string& csvPath, const BenchmarkConfig& cfg,
             << p99 << ","
             << p999 << ","
             << maxVal << ","
+            << meanInterval << ","
+            << p99Interval << ","
+            << maxInterval << ","
             << status << "\n";
 
     std::cout << "[Telemetry] Appended run results to " << csvPath << "\n";
@@ -308,6 +430,10 @@ void appendToCSV(const std::string& csvPath, const BenchmarkConfig& cfg,
 
 
 int main(int argc, char* argv[]) {
+    // Break glibc multi-arena isolation: force all threads (preconditioning, audio callback, churn workers)
+    // to share the single global heap arena. This ensures the audio thread allocates directly within the
+    // fragmented heap holes created by HeapPoisoner and contends on the arena mutex with background churn.
+    mallopt(M_ARENA_MAX, 1);
 
     BenchmarkConfig cfg = parseCommandLine(argc, argv);
 
@@ -323,9 +449,19 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    std::cout << "\nAvailable Audio Output Devices:\n";
     unsigned int defaultDevice = dac.getDefaultOutputDevice();
-    RtAudio::DeviceInfo info = dac.getDeviceInfo(defaultDevice);
-    std::cout << "Using Output Device: " << info.name << " (ID: " << defaultDevice << ")\n";
+    for (unsigned int id : deviceIds) {
+        RtAudio::DeviceInfo devInfo = dac.getDeviceInfo(id);
+        if (devInfo.outputChannels > 0) {
+            std::cout << "  - ID " << std::setw(3) << id << ": " << devInfo.name
+                      << (id == defaultDevice ? " [DEFAULT]" : "") << "\n";
+        }
+    }
+
+    unsigned int selectedDevice = (cfg.deviceId >= 0) ? static_cast<unsigned int>(cfg.deviceId) : defaultDevice;
+    RtAudio::DeviceInfo info = dac.getDeviceInfo(selectedDevice);
+    std::cout << "\nUsing Output Device: " << info.name << " (ID: " << selectedDevice << ")\n";
 
     // Initialize and run Heap Poisoner
     HeapPoisoner poisoner;
@@ -358,12 +494,13 @@ int main(int argc, char* argv[]) {
     unsigned int bufferFrames = 128; // 128 frames @ 48kHz = 2.666 ms hard real-time deadline budget
 
     RtAudio::StreamParameters parameters;
-    parameters.deviceId = defaultDevice;
-    parameters.nChannels = 2;
+    parameters.deviceId = selectedDevice;
+    parameters.nChannels = std::min(2u, info.outputChannels);
     parameters.firstChannel = 0;
 
     RtAudio::StreamOptions options;
-    options.flags = RTAUDIO_MINIMIZE_LATENCY; // Enforce minimum ALSA period size for low-latency operation
+    options.flags = RTAUDIO_MINIMIZE_LATENCY | RTAUDIO_SCHEDULE_REALTIME; // Request low-latency period and real-time thread scheduling
+    options.priority = 50;
 
     RtAudioErrorType err = dac.openStream(
         &parameters,

@@ -9,6 +9,10 @@
 #include <random>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
+#include <sched.h>
+#include <sys/syscall.h>
+#include <sys/resource.h>
 #include <malloc.h> // glibc mallinfo2() heap diagnostic API
 
 class HeapPoisoner {
@@ -148,6 +152,11 @@ public:
 
         for (size_t t = 0; t < numThreads; ++t) {
             churnWorkers_.emplace_back([this, t]() {
+                // Set lowest possible scheduling priority (SCHED_IDLE + nice = +19) so the audio thread strictly dominates CPU cores
+                struct sched_param sp = {0};
+                sched_setscheduler(0, SCHED_IDLE, &sp);
+                setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 19);
+
                 const size_t churnSizes[] = {64, 256, 1024, 4096, 16384, 65536};
                 std::vector<void*> tempBlocks(16, nullptr);
 

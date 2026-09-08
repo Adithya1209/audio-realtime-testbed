@@ -34,3 +34,13 @@ _deps/
 Thumbs.db
 .vscode/
 .idea/
+
+# Research notes and papers
+PROPOSAL_NOTES.md
+*.pdf
+*.csv
+
+# Phase 4 Work In Progress (uncommitted)
+RegionAllocator.hpp
+run_stress_sweep.sh
+
